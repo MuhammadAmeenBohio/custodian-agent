@@ -1,0 +1,330 @@
+name: custodian
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: custodian-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env}
+      AGENT_DB_PASSWORD: ${AGENT_DB_PASSWORD:?set AGENT_DB_PASSWORD in .env}
+      LEDGER_DB_PASSWORD: ${LEDGER_DB_PASSWORD:?set LEDGER_DB_PASSWORD in .env}
+      LEDGER_API_DB_PASSWORD: ${LEDGER_API_DB_PASSWORD:?set LEDGER_API_DB_PASSWORD in .env}
+      VENDORS_DB_PASSWORD: ${VENDORS_DB_PASSWORD:?set VENDORS_DB_PASSWORD in .env}
+      VENDORS_RO_DB_PASSWORD: ${VENDORS_RO_DB_PASSWORD:?set VENDORS_RO_DB_PASSWORD in .env}
+      POLICY_DB_PASSWORD: ${POLICY_DB_PASSWORD:?set POLICY_DB_PASSWORD in .env}
+      AUDIT_DB_PASSWORD: ${AUDIT_DB_PASSWORD:?set AUDIT_DB_PASSWORD in .env}
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-15432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # Optional: drop *.sql / *.sh files here to run on first init
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - custodian-net
+
+  objectstore:
+    image: chrislusf/seaweedfs:4.48   # pinned: `weed version` of the tested container reported 4.48
+    container_name: custodian-objectstore
+    restart: unless-stopped
+    command: server -s3 -dir=/data -s3.port=8333
+    ports:
+      - "127.0.0.1:${OBJECTSTORE_PORT:-18333}:8333"
+    volumes:
+      - objectstore_data:/data
+    networks:
+      - custodian-net
+
+  # One-shot job: creates the default bucket(s), then exits
+  objectstore-init:
+    image: amazon/aws-cli:2.37.10   # pinned: version of the tested image
+    container_name: custodian-objectstore-init
+    depends_on:
+      - objectstore
+    environment:
+      AWS_ACCESS_KEY_ID: ${OBJECTSTORE_ACCESS_KEY:-dev}
+      AWS_SECRET_ACCESS_KEY: ${OBJECTSTORE_SECRET_KEY:-dev}
+      AWS_DEFAULT_REGION: us-east-1
+    volumes:
+      - ./objectstore-init/init.sh:/init.sh:ro
+    entrypoint: ["/bin/sh", "/init.sh"]
+    restart: "no"
+    networks:
+      - custodian-net
+
+  ledger:
+    build: ./ledger
+    image: custodian-ledger:dev
+    container_name: custodian-ledger
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"   # the port inside the network, not the 15432 host port from .env
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env}
+      LEDGER_API_DB_PASSWORD: ${LEDGER_API_DB_PASSWORD:?set LEDGER_API_DB_PASSWORD in .env}
+    ports:
+      - "127.0.0.1:${LEDGER_PORT:-18001}:8000"   # dev only; removed once the backend is the only caller
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    networks:
+      - custodian-net
+
+  backend:
+    build:
+      context: .                      # the repo root: the image needs shared/iban.py (what enters is set by backend/Dockerfile.dockerignore)
+      dockerfile: backend/Dockerfile
+    image: custodian-backend:dev
+    container_name: custodian-backend
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"   # the port inside the network, not the 15432 host port from .env
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env}
+      AGENT_DB_PASSWORD: ${AGENT_DB_PASSWORD:?set AGENT_DB_PASSWORD in .env}
+      VENDORS_RO_DB_PASSWORD: ${VENDORS_RO_DB_PASSWORD:?set VENDORS_RO_DB_PASSWORD in .env}   # read-only vendor facts
+      PIPELINE_ENABLED: "true"        # POST /runs starts the pipeline in the background
+      LANGSMITH_TRACING: "false"      # langgraph pulls in langsmith; nothing may be sent to a hosted tracer
+      LANGCHAIN_TRACING_V2: "false"   # the older name for the same switch
+      # Langfuse tracing (backend/tracing.py): on only when all three are non-empty, i.e. after `--profile observe`
+      # has been set up and LANGFUSE_INTERNAL_URL is in .env. The .env names differ from the SDK's on purpose: the SDK
+      # names in .env would also switch tracing on for local pytest and uvicorn.
+      LANGFUSE_BASE_URL: ${LANGFUSE_INTERNAL_URL:-}
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_INIT_PROJECT_PUBLIC_KEY:-}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_INIT_PROJECT_SECRET_KEY:-}
+      OBJECTSTORE_ENDPOINT: http://objectstore:8333
+      OBJECTSTORE_ACCESS_KEY: ${OBJECTSTORE_ACCESS_KEY:-dev}
+      OBJECTSTORE_SECRET_KEY: ${OBJECTSTORE_SECRET_KEY:-dev}
+      LITELLM_BASE_URL: http://litellm:4000
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?set LITELLM_MASTER_KEY in .env}
+    ports:
+      - "127.0.0.1:${BACKEND_PORT:-18000}:8000"   # dev only; the console is the only published app port at the end
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    networks:
+      - custodian-net
+
+  litellm-redis:
+    image: redis:7.4-alpine
+    container_name: custodian-litellm-redis
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]   # cache only: nothing is written to disk
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - custodian-net
+
+  litellm:
+    image: ghcr.io/berriai/litellm:main-v1.83.14-stable   # pinned: tag checked in the registry
+    container_name: custodian-litellm
+    restart: unless-stopped
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    depends_on:
+      litellm-redis:
+        condition: service_healthy
+    environment:
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?set LITELLM_MASTER_KEY in .env (starts with sk-)}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # Docker Desktop adds this itself; Linux and CI need it
+    volumes:
+      - ./litellm/config.yaml:/app/config.yaml:ro
+    ports:
+      - "127.0.0.1:${LITELLM_PORT:-14000}:4000"   # dev only; later only the backend calls the gateway
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:4000/health/liveliness')"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 40s
+    networks:
+      - custodian-net
+
+  # ---- observe profile (WBS 4.2): self-hosted Langfuse. Start with: docker compose --profile observe up -d ----
+  # Not started by a plain `docker compose up`. Only the web UI is published (127.0.0.1 only); the rest stays on
+  # custodian-net. Secrets come from .env (LANGFUSE_*); empty defaults here so that a plain `docker compose` never
+  # fails for people who do not use this profile. Traces hold invoice text: synthetic data only until PII masking (3.1).
+  langfuse-postgres:
+    image: postgres:16-alpine
+    container_name: custodian-langfuse-postgres
+    profiles: ["observe"]
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: langfuse
+      POSTGRES_PASSWORD: ${LANGFUSE_DB_PASSWORD:-}
+      POSTGRES_DB: langfuse
+    volumes:
+      - langfuse_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U langfuse -d langfuse"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - custodian-net
+
+  langfuse-clickhouse:
+    image: docker.io/clickhouse/clickhouse-server:25.12
+    container_name: custodian-langfuse-clickhouse
+    profiles: ["observe"]
+    restart: unless-stopped
+    user: "101:101"
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: ${LANGFUSE_CLICKHOUSE_PASSWORD:-}
+    volumes:
+      - langfuse_clickhouse_data:/var/lib/clickhouse
+      - langfuse_clickhouse_logs:/var/log/clickhouse-server
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    networks:
+      - custodian-net
+
+  langfuse-redis:
+    image: redis:7.4-alpine
+    container_name: custodian-langfuse-redis
+    profiles: ["observe"]
+    restart: unless-stopped
+    command: ["redis-server", "--requirepass", "${LANGFUSE_REDIS_AUTH:-}", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - langfuse_redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"${LANGFUSE_REDIS_AUTH:-}\" --no-auth-warning ping | grep -q PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - custodian-net
+
+  langfuse-minio:
+    image: cgr.dev/chainguard/minio   # Langfuse's own choice; the registry offers no version tag to pin
+    container_name: custodian-langfuse-minio
+    profiles: ["observe"]
+    restart: unless-stopped
+    entrypoint: sh
+    command: -c 'mkdir -p /data/langfuse && minio server --address ":9000" --console-address ":9001" /data'   # creates the bucket
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: ${LANGFUSE_MINIO_PASSWORD:-}
+    volumes:
+      - langfuse_minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - custodian-net
+
+  langfuse-worker:
+    image: docker.langfuse.com/langfuse/langfuse-worker:4
+    container_name: custodian-langfuse-worker
+    profiles: ["observe"]
+    restart: unless-stopped
+    depends_on: &langfuse-depends-on
+      langfuse-postgres:
+        condition: service_healthy
+      langfuse-clickhouse:
+        condition: service_healthy
+      langfuse-redis:
+        condition: service_healthy
+      langfuse-minio:
+        condition: service_healthy
+    environment: &langfuse-env
+      TELEMETRY_ENABLED: "false"          # otherwise an aggregate usage event goes to PostHog Cloud; must be off on web AND worker
+      NEXT_TELEMETRY_DISABLED: "1"
+      NEXTAUTH_URL: http://localhost:${LANGFUSE_PORT:-13001}
+      DATABASE_URL: postgresql://langfuse:${LANGFUSE_DB_PASSWORD:-}@langfuse-postgres:5432/langfuse
+      SALT: ${LANGFUSE_SALT:-}
+      ENCRYPTION_KEY: ${LANGFUSE_ENCRYPTION_KEY:-}
+      CLICKHOUSE_MIGRATION_URL: clickhouse://langfuse-clickhouse:9000
+      CLICKHOUSE_URL: http://langfuse-clickhouse:8123
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: ${LANGFUSE_CLICKHOUSE_PASSWORD:-}
+      CLICKHOUSE_CLUSTER_ENABLED: "false"
+      REDIS_HOST: langfuse-redis
+      REDIS_PORT: "6379"
+      REDIS_AUTH: ${LANGFUSE_REDIS_AUTH:-}
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: minio
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${LANGFUSE_MINIO_PASSWORD:-}
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://langfuse-minio:9000
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_EVENT_UPLOAD_PREFIX: events/
+      LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: langfuse   # media upload (images in traces) is not used and MinIO is not published
+      LANGFUSE_S3_MEDIA_UPLOAD_REGION: auto
+      LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: minio
+      LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: ${LANGFUSE_MINIO_PASSWORD:-}
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://langfuse-minio:9000
+      LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: media/
+    networks:
+      - custodian-net
+
+  langfuse-web:
+    image: docker.langfuse.com/langfuse/langfuse:4
+    container_name: custodian-langfuse-web
+    profiles: ["observe"]
+    restart: unless-stopped
+    depends_on: *langfuse-depends-on
+    environment:
+      <<: *langfuse-env
+      NEXTAUTH_SECRET: ${LANGFUSE_NEXTAUTH_SECRET:-}
+      LANGFUSE_DISABLE_SIGNUP_ONBOARDING: "true"   # skips the newsletter step, which calls out to langfuse.com
+      # First start only: creates the organisation, project, user and the project's API keys from .env.
+      LANGFUSE_INIT_ORG_ID: custodian
+      LANGFUSE_INIT_ORG_NAME: Custodian
+      LANGFUSE_INIT_PROJECT_ID: custodian-dev
+      LANGFUSE_INIT_PROJECT_NAME: custodian-dev
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_INIT_PROJECT_PUBLIC_KEY:-}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_INIT_PROJECT_SECRET_KEY:-}
+      LANGFUSE_INIT_USER_EMAIL: ${LANGFUSE_INIT_USER_EMAIL:-}
+      LANGFUSE_INIT_USER_NAME: Admin
+      LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD:-}
+    ports:
+      - "127.0.0.1:${LANGFUSE_PORT:-13001}:3000"
+    networks:
+      - custodian-net
+
+networks:
+  custodian-net:
+    name: custodian-net
+    driver: bridge
+
+volumes:
+  postgres_data:
+  objectstore_data:
+  langfuse_postgres_data:
+  langfuse_clickhouse_data:
+  langfuse_clickhouse_logs:
+  langfuse_minio_data:
+  langfuse_redis_data:

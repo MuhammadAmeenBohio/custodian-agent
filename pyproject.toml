@@ -1,0 +1,34 @@
+[project]
+name = "bank-payables"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "boto3>=1.43.109",
+    "faker>=40.43.0",
+    "fastapi>=0.152.0",
+    "great-expectations>=1.24.0",
+    "httpx>=0.28.1",
+    "langfuse>=5.0.4",
+    "langgraph>=1.2.16",
+    "pandas>=3.0.6",
+    "pillow>=13.0.0",
+    "psycopg[binary]>=3.3.6",
+    "pytest>=9.1.1",
+    "python-dotenv>=1.2.4",
+    "ruff>=0.17.1",
+    "uvicorn>=0.54.0",
+]
+
+[tool.ruff]
+line-length = 120
+extend-exclude = ["ingest_data.ipynb", "invoice_data", "generated", "eval/evidence"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+markers = [
+    "integration: needs the Docker Compose stack running",
+    "live_llm: calls the real local model through the gateway (slow, local only, never in CI)",
+]

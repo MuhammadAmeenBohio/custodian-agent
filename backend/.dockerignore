@@ -1,0 +1,5 @@
+# Send only what the image needs. Keeps .env and local files out of the build context.
+*
+!requirements.txt
+!app.py
+!store.py

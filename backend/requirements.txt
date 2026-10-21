@@ -1,0 +1,11 @@
+# Runtime dependencies of the backend API, pinned to the versions in uv.lock.
+# Keep in step with pyproject.toml when these change (see docs/decisions.md).
+fastapi==0.152.0
+uvicorn==0.54.0
+psycopg[binary]==3.3.6
+python-dotenv==1.2.4
+pydantic==2.14.1
+boto3==1.43.109
+httpx==0.28.1
+langgraph==1.2.16
+langfuse==5.0.4

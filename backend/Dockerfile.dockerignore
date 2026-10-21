@@ -1,0 +1,5 @@
+# Allowlist: nothing enters the backend image unless it is listed here.
+*
+!backend/requirements.txt
+!backend/*.py
+!shared/iban.py

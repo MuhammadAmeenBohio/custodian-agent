@@ -1,0 +1,23 @@
+# LiteLLM gateway config (1.2.3). Every service calls the gateway by the names below, never Ollama directly.
+# Ollama runs on the host, not in Compose; containers reach it at host.docker.internal.
+model_list:
+  - model_name: vision      # reads invoice images
+    litellm_params:
+      model: ollama_chat/qwen2.5vl:3b
+      api_base: http://host.docker.internal:11434
+  - model_name: reasoner    # risk assessment and payment proposal (text only)
+    litellm_params:
+      model: ollama_chat/qwen2.5:7b
+      api_base: http://host.docker.internal:11434
+
+litellm_settings:
+  cache: true
+  cache_params:
+    type: redis
+    host: litellm-redis
+    port: 6379
+    ttl: 3600
+  drop_params: true   # ignore parameters Ollama does not support instead of failing
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY   # must start with sk-

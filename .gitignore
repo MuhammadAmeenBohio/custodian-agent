@@ -1,0 +1,45 @@
+# Secrets: never commit real values
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Editor and OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local scratch files
+out.txt
+*.log
+*.ipynb
+main.py
+CLAUDE.local.md
+Claude.local.md
+CLAUDE.md
+.claude/
+scratch_*.py
+
+# Working notes and agent files: local only (every .md except the root README)
+*.md
+!/README.md
+AGENTS.md
+CLAUDE*.md
+WBS.md
+docs/
+
+# Tool caches and evidence-run output
+.ruff_cache/
+eval/evidence/
+*.out
+
+# Invoice images are data, not code
+invoice_data/
+generated/
+eval/evidence/**/ocr_out/

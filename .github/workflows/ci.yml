@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint-and-unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --frozen
+      - run: uv run ruff check .
+      - name: Unit tests (no Docker, no LLM)
+        run: uv run python -m pytest -m "not integration"
+
+  core-smoke:
+    needs: lint-and-unit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --frozen
+      - name: Create .env from the example (fake placeholder values only)
+        run: cp .env.example .env
+      - run: docker compose config --quiet
+      - name: Start Postgres and the object store
+        run: docker compose up -d
+      - name: Wait for Postgres healthy and the bucket-init job to exit 0
+        run: |
+          for i in $(seq 1 60); do
+            health=$(docker inspect -f '{{.State.Health.Status}}' custodian-postgres)
+            init=$(docker inspect -f '{{.State.Status}} {{.State.ExitCode}}' custodian-objectstore-init)
+            ledger=$(docker inspect -f '{{.State.Health.Status}}' custodian-ledger)
+            backend=$(docker inspect -f '{{.State.Health.Status}}' custodian-backend)
+            echo "postgres=$health init=$init ledger=$ledger backend=$backend"
+            if [ "$health" = "healthy" ] && [ "$init" = "exited 0" ] && [ "$ledger" = "healthy" ] && [ "$backend" = "healthy" ]; then exit 0; fi
+            sleep 5
+          done
+          docker compose logs
+          exit 1
+      - name: Seed (generate, render, upload, run the 8 data checks)
+        run: |
+          uv run python loader/generate.py
+          uv run python loader/render.py
+          uv run python loader/upload.py
+          uv run python loader/validate.py
+      - name: Ledger and backend schemas
+        run: |
+          uv run python ledger/apply_schema.py
+          uv run python backend/apply_schema.py
+      - name: Integration tests
+        run: uv run python -m pytest -m "integration and not live_llm" -v
+      - name: Show logs on failure
+        if: failure()
+        run: docker compose logs
